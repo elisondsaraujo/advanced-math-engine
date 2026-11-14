@@ -1,177 +1,489 @@
+
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-High-Precision Mathematical Engine.
-Optimized for arbitrary-precision arithmetic using Python's decimal module.
-Designed for execution in terminal environments like Termux or AndroidIDE.
+HIGH-PRECISION MATHEMATICAL ENGINE
+Version: 2.0
+Python: 3.9+
+Platforms: Termux, AndroidIDE, Linux, Windows
+
+Features:
+- Pi calculation using Chudnovsky + Binary Splitting.
+- Arbitrary-precision square root using Decimal.
+- Monte Carlo Pi estimation.
+- Isolated decimal contexts.
+- Correct decimal rounding.
+- Input validation and exception handling.
+- Integrated automated tests.
+- No external dependencies.
 """
 
 import argparse
 import random
-from decimal import Decimal, getcontext
+import sys
+import unittest
+
+from decimal import (
+    Decimal,
+    localcontext,
+    InvalidOperation,
+    DecimalException,
+)
 
 
-def calculate_pi_chudnovsky(digits: int) -> str:
-    """Calculates Pi to the specified number of decimal places 
-    using the optimized Chudnovsky recurrence algorithm.
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-    Args:
-        digits: Number of decimal places to calculate.
+VERSION = "2.0"
 
-    Returns:
-        A string representation of Pi with the requested precision.
-    """
+CHUDNOVSKY_A = 13591409
+CHUDNOVSKY_B = 545140134
+CHUDNOVSKY_C = 640320
+
+CHUDNOVSKY_C3_OVER_24 = CHUDNOVSKY_C**3 // 24
+
+GUARD_DIGITS = 25
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def validate_digits(digits: int) -> None:
+    if isinstance(digits, bool) or not isinstance(digits, int):
+        raise ValueError("Digits must be an integer.")
+
     if digits < 0:
-        raise ValueError("Digits must be a non-negative integer.")
-
-    # Set decimal precision with a safety margin to eliminate rounding artifacts
-    extra_digits = 10
-    getcontext().prec = digits + extra_digits
-
-    C = Decimal(640320)
-    constant_multiplier = Decimal(13591409)
-    linear_multiplier = Decimal(545140134)
-
-    total_sum = Decimal(constant_multiplier)
-    term = Decimal(constant_multiplier)
-
-    # Each iteration of the Chudnovsky series yields roughly 14 decimal digits
-    iterations = max(1, digits // 14 + 1)
-
-    for k in range(1, iterations):
-        k_dec = Decimal(k)
-        prev_k = Decimal(k - 1)
-
-        num1 = 6 * k - 5
-        num2 = 6 * k - 4
-        num3 = 6 * k - 3
-        num4 = 6 * k - 2
-        num5 = 6 * k - 1
-        num6 = 6 * k
-
-        den1 = 3 * k - 2
-        den2 = 3 * k - 1
-        den3 = 3 * k
-        den4 = k**3
-
-        sign = -1 if k % 2 != 0 else 1
-
-        numerator_factor = (
-            Decimal(sign)
-            * Decimal(num1)
-            * Decimal(num2)
-            * Decimal(num3)
-            * Decimal(num4)
-            * Decimal(num5)
-            * Decimal(num6)
-            * (linear_multiplier * k_dec + constant_multiplier)
-        )
-
-        denominator_factor = (
-            Decimal(den1)
-            * Decimal(den2)
-            * Decimal(den3)
-            * Decimal(den4)
-            * (C**3)
-            * (linear_multiplier * prev_k + constant_multiplier)
-        )
-
-        term = term * (numerator_factor / denominator_factor)
-        total_sum += term
-
-    c_sqrt = (C * 10005).sqrt()
-    scaling_factor = Decimal(4268800) * c_sqrt
-    pi_value = scaling_factor / total_sum
-
-    pi_str = str(pi_value)
-    if digits == 0:
-        return pi_str.split(".")[0]
-
-    integer_part, decimal_part = pi_str.split(".")
-    return f"{integer_part}.{decimal_part[:digits]}"
+        raise ValueError("Digits cannot be negative.")
 
 
-def calculate_sqrt(number: str, digits: int) -> str:
-    """Calculates high-precision square root of a numeric string.
+def validate_samples(samples: int) -> None:
+    if isinstance(samples, bool) or not isinstance(samples, int):
+        raise ValueError("Samples must be an integer.")
 
-    Args:
-        number: The target number as a string or numeric value.
-        digits: Number of decimal places.
+    if samples <= 0:
+        raise ValueError("Samples must be greater than zero.")
+
+
+# ============================================================
+# CHUDNOVSKY: BINARY SPLITTING
+# ============================================================
+
+def binary_split(a: int, b: int):
+    """
+    Calculates the Chudnovsky series using Binary Splitting.
 
     Returns:
-        String representation of the square root.
+        P, Q, T
+
+    Uses exact integer arithmetic, avoiding intermediate
+    Decimal rounding during the series calculation.
     """
-    getcontext().prec = digits + 10
-    dec_num = Decimal(number)
-    if dec_num < 0:
+
+    if b <= a:
+        raise ValueError("Invalid binary splitting interval.")
+
+    if b - a == 1:
+
+        if a == 0:
+            return 1, 1, CHUDNOVSKY_A
+
+        P = (
+            (6 * a - 5)
+            * (2 * a - 1)
+            * (6 * a - 1)
+        )
+
+        Q = (
+            a**3
+            * CHUDNOVSKY_C3_OVER_24
+        )
+
+        T = P * (
+            CHUDNOVSKY_A
+            + CHUDNOVSKY_B * a
+        )
+
+        if a % 2:
+            T = -T
+
+        return P, Q, T
+
+    midpoint = (a + b) // 2
+
+    P1, Q1, T1 = binary_split(a, midpoint)
+    P2, Q2, T2 = binary_split(midpoint, b)
+
+    P = P1 * P2
+    Q = Q1 * Q2
+    T = T1 * Q2 + P1 * T2
+
+    return P, Q, T
+
+
+# ============================================================
+# PI: HIGH PRECISION
+# ============================================================
+
+def calculate_pi_chudnovsky(digits: int = 100) -> str:
+    """
+    Calculates Pi using Chudnovsky and Binary Splitting.
+
+    Each term provides approximately 14 decimal digits.
+
+    Returns a string rounded to the requested decimal places.
+    """
+
+    validate_digits(digits)
+
+    iterations = digits // 14 + 2
+
+    P, Q, T = binary_split(0, iterations)
+
+    with localcontext() as ctx:
+
+        ctx.prec = digits + GUARD_DIGITS
+
+        sqrt_10005 = Decimal(10005).sqrt()
+
+        numerator = (
+            Decimal(Q)
+            * Decimal(426880)
+            * sqrt_10005
+        )
+
+        pi_value = numerator / Decimal(T)
+
+        rounding_unit = Decimal(1).scaleb(-digits)
+
+        pi_value = pi_value.quantize(rounding_unit)
+
+        return f"{pi_value:.{digits}f}"
+
+
+# ============================================================
+# SQUARE ROOT: HIGH PRECISION
+# ============================================================
+
+def calculate_sqrt(number: str, digits: int = 50) -> str:
+    """
+    Calculates the square root using Python Decimal.
+
+    Supports arbitrary decimal input and proper rounding.
+    """
+
+    validate_digits(digits)
+
+    try:
+        dec_number = Decimal(str(number))
+
+    except (InvalidOperation, ValueError):
+        raise ValueError("Invalid numeric input.")
+
+    if not dec_number.is_finite():
+        raise ValueError("Number must be finite.")
+
+    if dec_number < 0:
         raise ValueError("Cannot calculate square root of a negative number.")
-    
-    result = dec_num.sqrt()
-    res_str = str(result)
-    if digits == 0:
-        return res_str.split(".")[0]
-    
-    integer_part, decimal_part = res_str.split(".")
-    return f"{integer_part}.{decimal_part[:digits]}"
+
+    integer_digits = max(
+        1,
+        dec_number.adjusted() // 2 + 2
+    ) if dec_number != 0 else 1
+
+    precision = integer_digits + digits + GUARD_DIGITS
+
+    with localcontext() as ctx:
+
+        ctx.prec = precision
+
+        result = dec_number.sqrt()
+
+        rounding_unit = Decimal(1).scaleb(-digits)
+
+        result = result.quantize(rounding_unit)
+
+        return f"{result:.{digits}f}"
 
 
-def estimate_pi_monte_carlo(samples: int) -> float:
-    """Estimates Pi using a Monte Carlo statistical simulation.
+# ============================================================
+# MONTE CARLO: PI ESTIMATION
+# ============================================================
 
-    Args:
-        samples: Number of random coordinate pairs generated.
-
-    Returns:
-        Estimated float value of Pi.
+def estimate_pi_monte_carlo(
+    samples: int = 1_000_000,
+    seed=None
+) -> float:
     """
+    Estimates Pi using Monte Carlo simulation.
+
+    Uses an optional seed for reproducible simulations.
+    Processes samples incrementally without storing coordinates.
+    """
+
+    validate_samples(samples)
+
+    rng = random.Random(seed)
+
     inside_circle = 0
+
     for _ in range(samples):
-        x = random.random()
-        y = random.random()
-        if x**2 + y**2 <= 1.0:
+
+        x = rng.random()
+        y = rng.random()
+
+        if x * x + y * y <= 1.0:
             inside_circle += 1
+
     return 4.0 * inside_circle / samples
 
 
+# ============================================================
+# AUTOMATED TESTS
+# ============================================================
+
+class MathematicalEngineTests(unittest.TestCase):
+
+    def test_pi_zero_digits(self):
+        self.assertEqual(
+            calculate_pi_chudnovsky(0),
+            "3"
+        )
+
+    def test_pi_precision(self):
+        self.assertEqual(
+            calculate_pi_chudnovsky(10),
+            "3.1415926536"
+        )
+
+    def test_pi_high_precision(self):
+        result = calculate_pi_chudnovsky(50)
+
+        self.assertEqual(
+            result,
+            "3.14159265358979323846264338327950288419716939937511"
+        )
+
+    def test_sqrt_two(self):
+        self.assertEqual(
+            calculate_sqrt("2", 10),
+            "1.4142135624"
+        )
+
+    def test_sqrt_zero(self):
+        self.assertEqual(
+            calculate_sqrt("0", 5),
+            "0.00000"
+        )
+
+    def test_sqrt_rounding(self):
+        self.assertEqual(
+            calculate_sqrt("2", 2),
+            "1.41"
+        )
+
+    def test_negative_sqrt(self):
+        with self.assertRaises(ValueError):
+            calculate_sqrt("-4", 10)
+
+    def test_invalid_pi_digits(self):
+        with self.assertRaises(ValueError):
+            calculate_pi_chudnovsky(-1)
+
+    def test_invalid_samples(self):
+        with self.assertRaises(ValueError):
+            estimate_pi_monte_carlo(0)
+
+    def test_monte_carlo_seed(self):
+        result1 = estimate_pi_monte_carlo(1000, seed=42)
+        result2 = estimate_pi_monte_carlo(1000, seed=42)
+
+        self.assertEqual(result1, result2)
+
+
+# ============================================================
+# COMMAND LINE INTERFACE
+# ============================================================
+
 def main():
+
     parser = argparse.ArgumentParser(
-        description="High-Precision Mathematical Engine for Termux and AndroidIDE."
+        prog="math_engine",
+        description=(
+            "High-Precision Mathematical Engine "
+            "for Termux and AndroidIDE."
+        )
     )
-    subparsers = parser.add_subparsers(dest="command", help="Available mathematical operations")
 
-    # Command: pi
-    parser_pi = subparsers.add_parser("pi", help="Calculate Pi using Chudnovsky algorithm")
-    parser_pi.add_argument("-d", "--digits", type=int, default=100, help="Number of decimal places (default: 100)")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"Math Engine {VERSION}"
+    )
 
-    # Command: sqrt
-    parser_sqrt = subparsers.add_parser("sqrt", help="Calculate high-precision square root")
-    parser_sqrt.add_argument("number", type=str, help="Number to evaluate")
-    parser_sqrt.add_argument("-d", "--digits", type=int, default=50, help="Number of decimal places (default: 50)")
+    subparsers = parser.add_subparsers(
+        dest="command",
+        help="Available mathematical operations"
+    )
 
-    # Command: monte-carlo
-    parser_mc = subparsers.add_parser("monte-carlo", help="Estimate Pi via Monte Carlo simulation")
-    parser_mc.add_argument("-s", "--samples", type=int, default=1000000, help="Number of sample points (default: 1000000)")
+    # --------------------------------------------------------
+    # PI COMMAND
+    # --------------------------------------------------------
+
+    parser_pi = subparsers.add_parser(
+        "pi",
+        help="Calculate Pi using Chudnovsky"
+    )
+
+    parser_pi.add_argument(
+        "-d",
+        "--digits",
+        type=int,
+        default=100,
+        help="Decimal places (default: 100)"
+    )
+
+    # --------------------------------------------------------
+    # SQRT COMMAND
+    # --------------------------------------------------------
+
+    parser_sqrt = subparsers.add_parser(
+        "sqrt",
+        help="Calculate high-precision square root"
+    )
+
+    parser_sqrt.add_argument(
+        "number",
+        type=str,
+        help="Number to evaluate"
+    )
+
+    parser_sqrt.add_argument(
+        "-d",
+        "--digits",
+        type=int,
+        default=50,
+        help="Decimal places (default: 50)"
+    )
+
+    # --------------------------------------------------------
+    # MONTE CARLO COMMAND
+    # --------------------------------------------------------
+
+    parser_mc = subparsers.add_parser(
+        "monte-carlo",
+        help="Estimate Pi using Monte Carlo"
+    )
+
+    parser_mc.add_argument(
+        "-s",
+        "--samples",
+        type=int,
+        default=1_000_000,
+        help="Number of samples"
+    )
+
+    parser_mc.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility"
+    )
+
+    # --------------------------------------------------------
+    # TEST COMMAND
+    # --------------------------------------------------------
+
+    subparsers.add_parser(
+        "test",
+        help="Run automated mathematical tests"
+    )
 
     args = parser.parse_args()
 
-    if args.command == "pi":
-        print(f"Calculando Pi com {args.digits} casas decimais...")
-        result = calculate_pi(args.digits)
-        print(f"\nResultado:\n{result}")
-    elif args.command == "sqrt":
-        print(f"Calculando raiz quadrada de {args.number} com {args.digits} casas...")
-        result = calculate_sqrt(args.number, args.digits)
-        print(f"\nResultado:\n{result}")
-    elif args.command == "monte-carlo":
-        print(f"Executando simulação de Monte Carlo com {args.samples} amostras...")
-        result = estimate_pi_monte_carlo(args.samples)
-        print(f"\nEstimativa de Pi: {result}")
-    else:
-        parser.print_help()
+    try:
+
+        if args.command == "pi":
+
+            print(
+                f"Calculating Pi with {args.digits} decimal places..."
+            )
+
+            result = calculate_pi_chudnovsky(args.digits)
+
+            print("\nResult:")
+            print(result)
+
+        elif args.command == "sqrt":
+
+            print(
+                f"Calculating sqrt({args.number}) "
+                f"with {args.digits} decimal places..."
+            )
+
+            result = calculate_sqrt(
+                args.number,
+                args.digits
+            )
+
+            print("\nResult:")
+            print(result)
+
+        elif args.command == "monte-carlo":
+
+            print(
+                f"Running Monte Carlo with "
+                f"{args.samples:,} samples..."
+            )
+
+            result = estimate_pi_monte_carlo(
+                args.samples,
+                seed=args.seed
+            )
+
+            print("\nPi estimation:")
+            print(f"{result:.15f}")
+
+        elif args.command == "test":
+
+            print("Running mathematical engine tests...\n")
+
+            suite = unittest.defaultTestLoader.loadTestsFromTestCase(
+                MathematicalEngineTests
+            )
+
+            runner = unittest.TextTestRunner(verbosity=2)
+
+            result = runner.run(suite)
+
+            if not result.wasSuccessful():
+                sys.exit(1)
+
+        else:
+
+            parser.print_help()
+
+    except (
+        ValueError,
+        InvalidOperation,
+        DecimalException,
+        ArithmeticError,
+        RecursionError
+    ) as error:
+
+        print(
+            f"\nError: {error}",
+            file=sys.stderr
+        )
+
+        sys.exit(1)
 
 
-def expansion_guide():
-    pass
-
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
